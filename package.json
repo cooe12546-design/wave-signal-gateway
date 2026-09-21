@@ -4,9 +4,9 @@
   "description": "Standalone L1 ingest gateway for canonical WAVE_SIGNAL_EVENT_V1 events from the Wave Market Sensor EA. Completely independent of Trading Insight Pro / Lovable / Supabase.",
   "private": true,
   "type": "module",
-  "engines": {
-    "node": ">=18.0.0"
-  },
+"engines": {
+  "node": ">=20.0.0"
+},
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
