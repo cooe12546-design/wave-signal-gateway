@@ -1,0 +1,32 @@
+{
+  "name": "wave-signal-gateway",
+  "version": "1.0.0",
+  "description": "Standalone L1 ingest gateway for canonical WAVE_SIGNAL_EVENT_V1 events from the Wave Market Sensor EA. Completely independent of Trading Insight Pro / Lovable / Supabase.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "test": "npm run test:gateway && npm run test:router && npm run test:line && npm run test:integration && npm run test:webhook",
+    "test:gateway": "tsx src/lib/selftest.ts",
+    "test:router": "tsx src/router/router.selftest.ts",
+    "test:line": "tsx src/line/line-sender.selftest.ts",
+    "test:integration": "tsx src/lib/integration.selftest.ts",
+    "test:webhook": "tsx src/lib/line-webhook.selftest.ts"
+  },
+  "dependencies": {
+    "fastify": "^5.2.0",
+    "better-sqlite3": "^11.3.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "tsx": "^4.16.5",
+    "@types/node": "^20.14.15",
+    "@types/better-sqlite3": "^7.6.11"
+  }
+}
