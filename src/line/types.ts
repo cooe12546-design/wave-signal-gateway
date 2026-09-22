@@ -5,6 +5,15 @@
 export interface SendLineTextParams {
   recipientId: string;
   messageText: string;
+  /**
+   * L5 OWNER AMENDMENT: an optional PRE-EXISTING retry key to reuse
+   * (persistent, restart-safe delivery rows pass their own stored
+   * retry_key here). If omitted, sendLineText() generates a fresh one
+   * exactly as before (L3's original ephemeral behavior) -- this keeps
+   * /line/test's existing behavior completely unchanged, since it never
+   * passes this field.
+   */
+  retryKey?: string;
 }
 
 export interface LineSenderConfig {

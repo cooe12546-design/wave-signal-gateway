@@ -72,7 +72,11 @@ async function safeReadBodySnippet(res: Response): Promise<string | null> {
  *     handle
  */
 export async function sendLineText(params: SendLineTextParams, config: LineSenderConfig): Promise<SendLineTextResult> {
-  const retryKey = randomUUID();
+  // L5 OWNER AMENDMENT: reuse a caller-supplied persistent retry key when
+  // given one; otherwise generate a fresh ephemeral one exactly as before
+  // (unchanged default -- /line/test and any other caller that omits this
+  // field is completely unaffected by this change).
+  const retryKey = params.retryKey ?? randomUUID();
   const fetchFn = config.fetchImpl ?? fetch;
 
   // --- Sender's own defensive boundary (brief §12/§13/§14) -- the Router

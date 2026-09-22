@@ -38,6 +38,10 @@ cp .env.example .env
 | `LINE_RETRY_DELAY_MS` | `1000` | Delay between LINE retry attempts. |
 | `LINE_TIMEOUT_MS` | `8000` | Per-attempt LINE request timeout. |
 | `LINE_CHANNEL_SECRET` | *(none)* | Verifies inbound `POST /line/webhook` signatures. **Different from `LINE_CHANNEL_ACCESS_TOKEN`** — never sent to LINE, only used locally for HMAC verification. |
+| `DELIVERY_STALE_SENDING_THRESHOLD_MS` | `300000` (5 min) | Interim default — see Persistent Delivery State below. |
+| `DELIVERY_MAX_PERSISTED_ATTEMPTS` | `8` | Interim default — total persisted retry attempts before a delivery becomes terminal. |
+| `DELIVERY_RETRY_BASE_DELAY_MS` | `30000` (30s) | Interim default — linear backoff unit for scheduling the next retry. |
+| `DELIVERY_SWEEP_INTERVAL_MS` | `15000` (15s) | How often the in-process retry sweep checks for due deliveries. |
 
 No real secret is committed anywhere in this repository — `.env.example` only contains placeholder values, and `.env` itself should never be committed (add it to your deployment platform's secret store instead).
 
@@ -58,6 +62,8 @@ npm run test:router        # L2: Alert Router A/B/C classification + templates (
 npm run test:line            # L3: LINE Sender retry/timeout/auth policy, mocked HTTP (28 assertions)
 npm run test:integration      # L3: full ingest -> Router -> LINE pipeline, mocked LINE fetch (13 assertions)
 npm run test:webhook           # L3A: LINE webhook signature verification, REAL computed HMAC (14 assertions)
+npm run test:accounts           # L4: account-routing header + recipient/subscription resolution (33 assertions)
+npm run test:deliveries          # L5: persistent delivery ledger, retry identity, restart recovery (50 assertions)
 ```
 
 `test:gateway` starts real, in-process Fastify server instances (backed by an in-memory SQLite database) and issues real HTTP requests against them, covering: health check, missing/wrong/unconfigured auth, every validation rule, a full valid insert with payload-preservation checks, retry idempotency, all 12 canonical event types, and a genuine concurrent-duplicate race test via `Promise.all`.
@@ -69,6 +75,10 @@ npm run test:webhook           # L3A: LINE webhook signature verification, REAL 
 `test:integration` exercises the **real** `/signal-events` route end-to-end (real SQLite, real validation, real `classifyEvent()`, only the LINE `fetch` call itself mocked) and verifies the critical cross-cutting invariants: a deliverable event triggers exactly one LINE call; `ENTRY_RETEST` triggers **zero** LINE calls; a duplicate (retried) event does **not** re-invoke the Router or LINE a second time; and ingest still returns success even when the mocked LINE call fails on every attempt or when `LINE_CHANNEL_ACCESS_TOKEN` is entirely unconfigured.
 
 `test:webhook` calls the real `POST /line/webhook` route with **genuinely computed HMAC-SHA256 signatures** (not a bypass) — verifying: missing secret/signature/invalid-signature rejection; LINE's own verification request (`events: []`) succeeds; a real `source.userId` is extracted and logged; multiple mixed user/group events are all handled correctly; secrets never appear in logs; and — the key proof that raw-byte verification is genuinely in effect — a signature computed for one exact byte sequence is correctly rejected when a *semantically identical but differently-formatted* JSON body is submitted instead.
+
+`test:accounts` covers Owner's exact L4 test matrix through both the real HTTP route and the resolver directly: header validation (missing/blank/valid `X-Account-Id`, auth checked first), `account_id` persisted as routing metadata with `payload_json` byte-for-byte unchanged, two different accounts routing to two different real LINE recipients, unknown-account and disabled-subscription/disabled-recipient/disabled-per-alert-preference all producing zero LINE sends, `ENTRY_RETEST` suppression and duplicate-event dedupe still holding under the new resolver path, and a dedicated structural check confirming `/line/test`'s actual source never imports the resolver at all.
+
+`test:deliveries` covers Owner's exact L5 test matrix: delivery-row dedupe (same/different recipient/alert-type combinations), persistent retry-key stability across attempts and a **genuine file-based SQLite close-and-reopen** (not simulated), every HTTP outcome's status classification (2xx/400/401/403/429/5xx/network/timeout), retry scheduling (due vs. not-due rows, bounded attempt exhaustion), real restart recovery for stale `SENDING` rows, the full pipeline creating the correct number/type of delivery rows for each alert class, and structural proof that `/line/test` never touches the delivery module or `alert_deliveries` at all.
 
 ## Alert Router (L2)
 
@@ -95,6 +105,49 @@ Templates are plain, deterministic text (V1, no Flex Message yet) — no trading
 
 A `POST /line/test` route (same `X-API-Key` gate as `/signal-events`) sends one fixed or bounded-length supplied test message to `LINE_TEST_RECIPIENT_ID`, for proving delivery independently of the ingest pipeline.
 
+## Recipient Binding (L4)
+
+Every `POST /signal-events` request must now include an `X-Account-Id` header — the **opaque external account-routing id**, sourced from the EA's own new `SignalAccountID` transport input (a separate, transport-only value, never inserted into the `WAVE_SIGNAL_EVENT_V1` JSON body). This gateway treats it as a pure opaque string: trimmed, non-empty, bounded length — **never validated against Trading Insight Pro or Supabase** (out of scope for this standalone gateway). A missing, empty, or whitespace-only header is rejected deterministically with `400 { error: "ACCOUNT_ID_REQUIRED" }`, **before** the JSON body is even parsed — no unroutable event is ever persisted. `X-Account-Id` is identity metadata, not authentication; `X-API-Key` remains the sole authentication mechanism, checked first, and both headers are required together.
+
+`account_id` is persisted alongside each stored event as gateway-owned routing metadata (`signal_events.account_id`) — it is never merged into `payload_json`, which remains byte-for-byte the original accepted payload. It is **not** part of the `event_key` dedupe identity: a retried/duplicate event keeps whatever `account_id` its first-ever insert recorded.
+
+Two new tables resolve an account to real LINE recipients:
+
+```sql
+line_recipients (id, line_user_id, recipient_type, enabled, created_at)
+alert_subscriptions (id, account_id, recipient_id, enabled,
+                      alert_a_enabled, alert_b_enabled, alert_c_enabled, created_at)
+```
+
+`resolveRecipients(db, accountId, alertType)` (`src/lib/recipients.ts`) returns every LINE recipient enabled for that account and that specific alert type — an unknown account, a disabled subscription, a disabled recipient, or that alert type's preference being off are all indistinguishable from the caller's side: zero recipients, zero LINE sends, enforced by one SQL query rather than scattered post-hoc checks. `POST /signal-events`'s own delivery step now calls this resolver instead of using a single hardcoded recipient — **`LINE_TEST_RECIPIENT_ID` is no longer read anywhere in the production ingest path**; it remains exclusively `/line/test`'s own concern (`src/routes/line-test.ts`, which has no dependency on `recipients.ts` at all — verified by a dedicated structural test that reads that file's actual source).
+
+No admin/HTTP surface for creating recipients or subscriptions exists yet — `createRecipient()`/`createSubscription()` in `src/lib/recipients.ts` are currently used only by the test suites. Building an admin API for managing these was not part of this task's scope.
+
+## Persistent Delivery State (L5)
+
+Every LINE delivery attempt is now backed by a persistent row in `alert_deliveries`, closing L3's own documented limitation (an in-memory-only retry key that didn't survive a process restart). `(event_key, recipient_id, alert_type)` is the sole persistent delivery identity, enforced by a real `UNIQUE` SQL constraint — the same race-safe "attempt INSERT, catch the constraint violation" pattern `signal_events.event_key` already used (never `SELECT`-then-`INSERT`).
+
+**Flow**: after a signal event is persisted and the Router says `shouldDeliver: true`, one delivery row is created per resolved recipient (`createDeliveryRow()`), and the first attempt runs immediately (`executeDelivery()`) — the same instant-delivery behavior as before L5, just now durable. `executeDelivery()` marks the row `SENDING`, calls `sendLineText()` **reusing the row's own persistent `retry_key`** (generated once, at row creation, never regenerated on retry — a small, backward-compatible addition to `sendLineText()`'s own params; omitting it, as `/line/test` still does, keeps that route's original ephemeral-key behavior byte-for-byte unchanged), classifies the outcome, and persists it.
+
+**Status machine**: `PENDING → SENDING → DELIVERED | FAILED_RETRYABLE | FAILED_PERMANENT`. Classification preserves L3's exact existing policy: 2xx → `DELIVERED`; 400/401/403 → `FAILED_PERMANENT`; 429 and 5xx and network/timeout → `FAILED_RETRYABLE` (with a deterministic `next_retry_at`); any other unexpected status → `FAILED_PERMANENT`.
+
+**Retry sweep**: a lightweight in-process `setInterval` (`DELIVERY_SWEEP_INTERVAL_MS`, default 15s — no external queue, no Redis, no cron) calls `runDueDeliveries()`, which queries only `status='FAILED_RETRYABLE' AND next_retry_at <= now` and retries each due row — a row not yet due is left completely untouched by the `WHERE` clause itself.
+
+**Restart recovery**: on every `openDatabase()` call (i.e. every process start), any `SENDING` row whose `updated_at` is older than `DELIVERY_STALE_SENDING_THRESHOLD_MS` (default 5 minutes) is converted back to `FAILED_RETRYABLE`, immediately due — handling the case where a process crashed mid-attempt. A fresh `SENDING` row is left alone, since it may still be a genuinely in-flight attempt.
+
+**Interim, Owner-reviewable defaults (not frozen — flagged explicitly, per that task's own instruction)**:
+| Setting | Default | Reasoning |
+|---|---|---|
+| `DELIVERY_STALE_SENDING_THRESHOLD_MS` | 300000 (5 min) | A generous multiple of the worst-case real attempt duration (`LINE_TIMEOUT_MS × LINE_MAX_ATTEMPTS` ≈ 24s with L3's own defaults) |
+| `DELIVERY_MAX_PERSISTED_ATTEMPTS` | 8 | Total persisted attempts (across the sweep, not L3's own internal per-call bounded retry) before a retryable failure becomes terminal |
+| `DELIVERY_RETRY_BASE_DELAY_MS` | 30000 (30s) | Linear backoff unit: `next_retry_at = now + base × attempt_count` |
+
+Whether a `FAILED_PERMANENT` row can ever be manually reset was **not built** — nothing in this task's scope needed that capability, so it simply doesn't exist; `FAILED_PERMANENT` is a true terminal state with no code path back to retryable.
+
+`retry_key` is treated as sensitive and is **never logged** — every `delivery.*` structured log includes only safe identifiers (`delivery_id`, `event_key`, `recipient_id`, `alert_type`, `attempt_count`, `http_status`, `error_code`).
+
+An optional, read-only `GET /deliveries/:eventKey` (same `X-API-Key` gate) returns every delivery row for one event, for QA inspection — no UI, no write operations.
+
 ## LINE Webhook — Test User-ID Capture (L3A)
 
 `src/routes/line-webhook.ts` — `POST /line/webhook`. A narrow, receive-only utility: verifies a real inbound LINE Messaging API webhook and logs `events[].source.userId` so you can copy a real value into `LINE_TEST_RECIPIENT_ID`. **Not part of the delivery pipeline** — it never calls the Router, the LINE Sender, or writes to SQLite.
@@ -114,14 +167,15 @@ A `POST /line/test` route (same `X-API-Key` gate as `/signal-events`) sends one 
 ```
 
 ### `POST /signal-events`
-Header: `X-API-Key: <SIGNAL_EVENT_API_KEY>`
+Headers: `X-API-Key: <SIGNAL_EVENT_API_KEY>` (authentication), `X-Account-Id: <opaque external account id>` (routing metadata, required — see Recipient Binding below).
 Body: one `WAVE_SIGNAL_EVENT_V1` JSON event.
 
 Responses:
 - `200 { ok: true, idempotent: false, id, event_key }` — new event stored.
 - `200 { ok: true, idempotent: true, event_key }` — duplicate `event_key`; nothing new was stored, the existing event remains unmodified.
+- `400 { ok: false, error: "ACCOUNT_ID_REQUIRED" }` — missing, empty, or whitespace-only `X-Account-Id`.
 - `400 { ok: false, error }` — schema/identity validation failed (invalid `schema_version`, unknown `event_type`, malformed identity fields, `event_key` not matching the deterministic `{signal_id}:{event_type}:{event_sequence}` format, or `event_id !== event_key`).
-- `401 { ok: false, error: "Unauthorized" }` — missing or incorrect `X-API-Key`.
+- `401 { ok: false, error: "Unauthorized" }` — missing or incorrect `X-API-Key` (checked before `X-Account-Id`).
 - `503 { ok: false, error: "Service unavailable" }` — `SIGNAL_EVENT_API_KEY` is not configured server-side.
 - `500 { ok: false, error: "Internal error" }` — unexpected storage failure.
 
@@ -142,6 +196,11 @@ Body: raw LINE webhook payload (`{"events": [...]}`, or `{"events": []}` for LIN
 - `401 { ok: false, error }` — missing or invalid `x-line-signature`.
 - `503 { ok: false, error: "Service unavailable" }` — `LINE_CHANNEL_SECRET` not configured.
 - `400 { ok: false, error }` — malformed body after successful signature verification.
+
+### `GET /deliveries/:eventKey`
+Header: `X-API-Key: <SIGNAL_EVENT_API_KEY>`
+
+Read-only inspection of persistent delivery state for one event. Returns `{ ok: true, event_key, deliveries: [...] }` — every `alert_deliveries` row for that event (status, attempt_count, http/error info, timestamps, and the stored message text). `retry_key` and any secret are never included in any API response.
 
 ## Storage
 
@@ -178,7 +237,7 @@ No Lovable, Supabase, or Trading-Insight-Pro dependency anywhere. Deploys anywhe
 
 - **L2 — Alert Router: DONE.** Classifies each stored event into Alert A / B / C with deterministic text, per the frozen B0 mapping. No LINE sending yet — `shouldDeliver` is returned, not acted on.
 - **L3 — LINE OA Sender: DONE** (this delivery). Real push-message delivery to one server-side test recipient, wired minimally into the ingest pipeline (fire-after-persist, never fire-before or in place of persistence).
-- **L4** — Recipient Binding: subscription/recipient mapping (frozen decision: account authority = Trading Insight Pro's `trade_accounts.id`, to be synced/bridged later, not duplicated here). Replaces the single `LINE_TEST_RECIPIENT_ID` env var with real per-account recipient resolution.
+- **L4 — Recipient Binding: DONE.** `X-Account-Id` header (opaque external id) required on every ingest; `line_recipients`/`alert_subscriptions` tables; per-account, per-alert-type recipient resolution replacing the single hardcoded test recipient in production.
 - **L5** — Retry / Delivery Dedupe / Logs: `alert_deliveries`-equivalent persistent record, `UNIQUE(event_key, recipient_id, alert_type)`, **restart-safe** retry identity (closing L3's own documented in-memory-only retry-key limitation), structured observability.
 - **L6** — End-to-end EA → LINE QA.
 

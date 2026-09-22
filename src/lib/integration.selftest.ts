@@ -1,10 +1,15 @@
 /**
  * Full integration self-test: POST /signal-events through the REAL Fastify
  * route (real SQLite, real validation, real classifyEvent(), real
- * sendLineText() call shape) with ONLY the LINE fetch call mocked (brief
- * §24's "regardless of real secrets, test sender behavior with controlled
- * mocked fetch" principle, applied end-to-end through the actual ingest
- * pipeline rather than the Sender in isolation).
+ * sendLineText() call shape, real resolveRecipients()) with ONLY the LINE
+ * fetch call mocked (brief §24's "regardless of real secrets, test sender
+ * behavior with controlled mocked fetch" principle, applied end-to-end
+ * through the actual ingest pipeline rather than the Sender in isolation).
+ *
+ * L4 OWNER AMENDMENT: every test now sends X-Account-Id, and a recipient +
+ * subscription are seeded directly in the same in-memory DB the route uses
+ * before any test that expects a LINE call to actually happen -- exercising
+ * the REAL resolveRecipients() code path, not a stub.
  *
  * Run with: npm run test:integration
  */
@@ -12,6 +17,7 @@ import Fastify from "fastify";
 import { openDatabase } from "./db.js";
 import { healthRoute } from "../routes/health.js";
 import { signalEventsRoute } from "../routes/signal-events.js";
+import { createRecipient, createSubscription } from "./recipients.js";
 import type { LineSenderConfig } from "../line/types.js";
 
 let pass = 0;
@@ -30,6 +36,7 @@ function check(name: string, condition: boolean, detail?: string): void {
 }
 
 const SECRET = "integration-test-secret";
+const ACCOUNT_ID = "ACC-INTEGRATION-TEST-001";
 
 function makeEvent(overrides: Record<string, unknown> = {}, seq = 1, eventType = "SIGNAL_CREATED") {
   const signalId = "SIG-XAUUSD-M5-20260920-093000-BUY-001";
@@ -61,14 +68,18 @@ function mockLineConfig(onCall: () => void): LineSenderConfig {
   };
 }
 
-async function buildIntegrationApp(lineCallCounter: { count: number }) {
+async function buildIntegrationApp(lineCallCounter: { count: number }, seedFullySubscribedAccount = true) {
   const app = Fastify({ logger: false });
   const db = openDatabase(":memory:");
   const lineConfig = mockLineConfig(() => {
     lineCallCounter.count++;
   });
+  if (seedFullySubscribedAccount) {
+    const recipientId = createRecipient(db, { lineUserId: "U-mock-recipient" });
+    createSubscription(db, { accountId: ACCOUNT_ID, recipientId });
+  }
   app.register(healthRoute);
-  app.register(signalEventsRoute, { db, apiKey: SECRET, lineConfig, lineTestRecipientId: "U-mock-recipient" });
+  app.register(signalEventsRoute, { db, apiKey: SECRET, lineConfig });
   await app.ready();
   return { app, db };
 }
@@ -83,14 +94,9 @@ async function main() {
     const res = await app.inject({
       method: "POST",
       url: "/signal-events",
-      headers: { "x-api-key": SECRET },
+      headers: { "x-api-key": SECRET, "x-account-id": ACCOUNT_ID },
       payload: makeEvent({}, 1, "SIGNAL_CREATED"),
     });
-    // Give the awaited classifyAndDeliver a moment to have already run --
-    // it is awaited inside the handler before the response is sent, so by
-    // the time inject() resolves this has already completed synchronously
-    // in the async chain; no extra wait should be needed, but this
-    // assertion checks the actual outcome either way.
     check("SIGNAL_CREATED ingest -> 200", res.statusCode === 200);
     check("SIGNAL_CREATED (Alert A, shouldDeliver=true) -> exactly one LINE call", counter.count === 1, `got ${counter.count}`);
     await app.close();
@@ -103,7 +109,7 @@ async function main() {
     const res = await app.inject({
       method: "POST",
       url: "/signal-events",
-      headers: { "x-api-key": SECRET },
+      headers: { "x-api-key": SECRET, "x-account-id": ACCOUNT_ID },
       payload: makeEvent({}, 1, "ENTRY_RETEST"),
     });
     check("ENTRY_RETEST ingest -> 200 (still stored)", res.statusCode === 200);
@@ -117,12 +123,12 @@ async function main() {
     const { app, db } = await buildIntegrationApp(counter);
     const ev = makeEvent({}, 7, "TP1_HIT");
 
-    const r1 = await app.inject({ method: "POST", url: "/signal-events", headers: { "x-api-key": SECRET }, payload: ev });
+    const r1 = await app.inject({ method: "POST", url: "/signal-events", headers: { "x-api-key": SECRET, "x-account-id": ACCOUNT_ID }, payload: ev });
     const b1 = r1.json();
     check("first POST -> idempotent=false", b1.idempotent === false);
     check("first POST -> LINE called once", counter.count === 1, `got ${counter.count}`);
 
-    const r2 = await app.inject({ method: "POST", url: "/signal-events", headers: { "x-api-key": SECRET }, payload: ev });
+    const r2 = await app.inject({ method: "POST", url: "/signal-events", headers: { "x-api-key": SECRET, "x-account-id": ACCOUNT_ID }, payload: ev });
     const b2 = r2.json();
     check("retry POST -> idempotent=true", b2.idempotent === true);
     check("retry POST -> LINE call count UNCHANGED (still 1, not re-invoked)", counter.count === 1, `got ${counter.count}`);
@@ -137,6 +143,8 @@ async function main() {
   {
     const app = Fastify({ logger: false });
     const db = openDatabase(":memory:");
+    const recipientId = createRecipient(db, { lineUserId: "U-mock-recipient" });
+    createSubscription(db, { accountId: ACCOUNT_ID, recipientId });
     const failingLineConfig: LineSenderConfig = {
       channelAccessToken: "mock-token",
       maxAttempts: 1,
@@ -147,13 +155,13 @@ async function main() {
       }) as unknown as typeof fetch,
     };
     app.register(healthRoute);
-    app.register(signalEventsRoute, { db, apiKey: SECRET, lineConfig: failingLineConfig, lineTestRecipientId: "U-mock-recipient" });
+    app.register(signalEventsRoute, { db, apiKey: SECRET, lineConfig: failingLineConfig });
     await app.ready();
 
     const res = await app.inject({
       method: "POST",
       url: "/signal-events",
-      headers: { "x-api-key": SECRET },
+      headers: { "x-api-key": SECRET, "x-account-id": ACCOUNT_ID },
       payload: makeEvent({}, 1, "SIGNAL_CREATED"),
     });
     const body = res.json();
@@ -170,6 +178,8 @@ async function main() {
   {
     const app = Fastify({ logger: false });
     const db = openDatabase(":memory:");
+    const recipientId = createRecipient(db, { lineUserId: "U-mock-recipient" });
+    createSubscription(db, { accountId: ACCOUNT_ID, recipientId });
     const unconfiguredLineConfig: LineSenderConfig = {
       channelAccessToken: undefined,
       maxAttempts: 1,
@@ -183,10 +193,25 @@ async function main() {
     const res = await app.inject({
       method: "POST",
       url: "/signal-events",
-      headers: { "x-api-key": SECRET },
+      headers: { "x-api-key": SECRET, "x-account-id": ACCOUNT_ID },
       payload: makeEvent({}, 1, "SIGNAL_CREATED"),
     });
     check("ingest succeeds even with LINE entirely unconfigured (no token)", res.statusCode === 200 && res.json().idempotent === false);
+    await app.close();
+  }
+
+  // ---- L4: unknown account (no subscription seeded at all) -> ingest 200, ZERO LINE calls ----
+  {
+    const counter = { count: 0 };
+    const { app } = await buildIntegrationApp(counter, /* seedFullySubscribedAccount */ false);
+    const res = await app.inject({
+      method: "POST",
+      url: "/signal-events",
+      headers: { "x-api-key": SECRET, "x-account-id": "ACC-COMPLETELY-UNKNOWN" },
+      payload: makeEvent({}, 1, "SIGNAL_CREATED"),
+    });
+    check("unknown account -> ingest still 200 (event persisted)", res.statusCode === 200);
+    check("unknown account -> ZERO LINE calls", counter.count === 0, `got ${counter.count}`);
     await app.close();
   }
 

@@ -13,6 +13,14 @@ import { healthRoute } from "../routes/health.js";
 import { signalEventsRoute } from "../routes/signal-events.js";
 
 const SCHEMA_VERSION = "WAVE_SIGNAL_EVENT_V1";
+// L4 OWNER AMENDMENT: every /signal-events POST now requires X-Account-Id.
+// A fixed test value here -- this suite's own concerns (auth, schema
+// validation, idempotency, event-type coverage) are orthogonal to L4's
+// account-routing/recipient-resolution concerns, which get their own
+// dedicated suite (src/lib/accounts.selftest.ts). No recipients are seeded
+// for this account id in this suite -- these tests don't assert on LINE
+// delivery outcomes at all, only on ingest/storage behavior.
+const TEST_ACCOUNT_ID = "ACC-L1-GATEWAY-TEST-001";
 const ALL_12_EVENT_TYPES = [
   "SIGNAL_CREATED",
   "MARKET_CONTEXT_SNAPSHOT",
@@ -122,7 +130,7 @@ async function main() {
   // ---- validation failures ----
   {
     const { app } = await buildTestApp(SECRET);
-    const headers = { "x-api-key": SECRET };
+    const headers = { "x-api-key": SECRET, "x-account-id": TEST_ACCOUNT_ID };
 
     const r1 = await app.inject({ method: "POST", url: "/signal-events", headers, payload: makeEvent({ schema_version: "WRONG_VERSION" }) });
     check("wrong schema_version -> 400", r1.statusCode === 400);
@@ -156,7 +164,7 @@ async function main() {
   {
     const { app, db } = await buildTestApp(SECRET);
     const ev = makeEvent();
-    const res = await app.inject({ method: "POST", url: "/signal-events", headers: { "x-api-key": SECRET }, payload: ev });
+    const res = await app.inject({ method: "POST", url: "/signal-events", headers: { "x-api-key": SECRET, "x-account-id": TEST_ACCOUNT_ID }, payload: ev });
     const body = res.json();
     check("valid SIGNAL_CREATED -> 200", res.statusCode === 200);
     check("idempotent=false on first insert", body.idempotent === false);
@@ -171,7 +179,7 @@ async function main() {
     check("convenience column direction extracted", row.direction === "BUY");
 
     // ---- retry idempotency ----
-    const res2 = await app.inject({ method: "POST", url: "/signal-events", headers: { "x-api-key": SECRET }, payload: ev });
+    const res2 = await app.inject({ method: "POST", url: "/signal-events", headers: { "x-api-key": SECRET, "x-account-id": TEST_ACCOUNT_ID }, payload: ev });
     const body2 = res2.json();
     check("retry same event -> 200", res2.statusCode === 200);
     check("retry -> idempotent=true", body2.idempotent === true);
@@ -187,7 +195,7 @@ async function main() {
     let allOk = true;
     for (let i = 0; i < ALL_12_EVENT_TYPES.length; i++) {
       const ev = makeEvent({}, i + 1, ALL_12_EVENT_TYPES[i]);
-      const res = await app.inject({ method: "POST", url: "/signal-events", headers: { "x-api-key": SECRET }, payload: ev });
+      const res = await app.inject({ method: "POST", url: "/signal-events", headers: { "x-api-key": SECRET, "x-account-id": TEST_ACCOUNT_ID }, payload: ev });
       if (res.statusCode !== 200) allOk = false;
     }
     const count = (db.prepare("SELECT COUNT(*) as c FROM signal_events").get() as any).c;
@@ -206,8 +214,8 @@ async function main() {
     const { app, db } = await buildTestApp(SECRET);
     const ev = makeEvent({}, 42, "TP1_HIT");
     const [r1, r2] = await Promise.all([
-      app.inject({ method: "POST", url: "/signal-events", headers: { "x-api-key": SECRET }, payload: ev }),
-      app.inject({ method: "POST", url: "/signal-events", headers: { "x-api-key": SECRET }, payload: ev }),
+      app.inject({ method: "POST", url: "/signal-events", headers: { "x-api-key": SECRET, "x-account-id": TEST_ACCOUNT_ID }, payload: ev }),
+      app.inject({ method: "POST", url: "/signal-events", headers: { "x-api-key": SECRET, "x-account-id": TEST_ACCOUNT_ID }, payload: ev }),
     ]);
     const bothOk = r1.statusCode === 200 && r2.statusCode === 200;
     const exactlyOneNonIdempotent =
